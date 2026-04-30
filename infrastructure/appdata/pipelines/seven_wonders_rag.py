@@ -8,9 +8,12 @@ description: Downloads Seven Wonders from Hugging Face and indexes them in pgvec
 requirements: requests,pydantic,psycopg[binary]
 """
 
+import asyncio
 import hashlib
 import json
+import logging
 import os
+import time
 from typing import Any, Dict, List
 
 import psycopg
@@ -30,28 +33,32 @@ class Pipeline:
 				"?dataset=bilgeyucel/seven-wonders&config=default&split=train&offset=0&length=100",
 			)
 		)
-		VDB_HOST: str = Field(default=os.getenv("VDB_HOST", "vdb"))
-		VDB_PORT: int = Field(default=int(os.getenv("VDB_PORT", "5432")))
-		VDB_DBNAME: str = Field(default=os.getenv("VDB_DBNAME", "postgres"))
-		VDB_USER: str = Field(default=os.getenv("VDB_USER", "postgres"))
-		VDB_PASSWORD: str = Field(default=os.getenv("VDB_PASSWORD", "pass456"))
+		VDB_HOST: str = Field(default=os.getenv("VDB_HOST", ""))
+		VDB_PORT: int = Field(default=int(os.getenv("VDB_PORT", "0")))
+		VDB_DBNAME: str = Field(default=os.getenv("VDB_DBNAME", ""))
+		VDB_USER: str = Field(default=os.getenv("VDB_USER", ""))
+		VDB_PASSWORD: str = Field(default=os.getenv("VDB_PASSWORD", ""))
 		TOP_K: int = Field(default=4)
 		MAX_CONTEXT_CHARS: int = Field(default=5000)
 		REQUEST_TIMEOUT_SECONDS: int = Field(default=450)
+		SYNC_INTERVAL_SECONDS: int = Field(default=int(os.getenv("SYNC_INTERVAL_SECONDS", "86400")))
 
 	def __init__(self):
 		self.id = "seven_wonders_rag"
 		self.name = "Seven Wonders RAG"
 		self.valves = self.Valves()
 		self._session = requests.Session()
+		self._last_sync_time = 0
 
 	async def on_startup(self):
-		try:
-			self._sync_dataset_to_pgvector()
-		except Exception:
-			# Preventing startup crash keeps Pipelines online so model can still be selected,
-			# and sync is retried on each user request.
-			return
+		async def _bg_sync():
+			try:
+				await asyncio.to_thread(self._sync_dataset_to_pgvector)
+				self._last_sync_time = time.time()
+			except Exception as e:
+				logging.error(f"Error en sincronización inicial de base de datos: {e}", exc_info=True)
+
+		asyncio.create_task(_bg_sync())
 
 	async def on_shutdown(self):
 		self._session.close()
@@ -108,7 +115,7 @@ class Pipeline:
 
 		eval_count = data.get("eval_count", 0)
 		eval_duration = data.get("eval_duration", 1)
-		tps = (eval_count / eval_duration) * 1_000_000_000
+		tps = (eval_count / eval_duration) * 1_000_000_000 if eval_duration > 0 else 0.0
 
 		return {
 			"answer": data.get("response", "No se pudo generar respuesta."),
@@ -141,10 +148,9 @@ class Pipeline:
 	def _ensure_vector_schema(self, conn, embedding_dim: int):
 		with conn.cursor() as cur:
 			cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-			cur.execute("DROP TABLE IF EXISTS sw_knowledge")
 			cur.execute(
 				f"""
-				CREATE TABLE sw_knowledge (
+				CREATE TABLE IF NOT EXISTS sw_knowledge (
 					id BIGSERIAL PRIMARY KEY,
 					source TEXT NOT NULL,
 					content TEXT NOT NULL,
@@ -197,50 +203,59 @@ class Pipeline:
 
 		with self._get_conn() as conn:
 			with conn.cursor() as cur:
-				cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-				cur.execute(
-					"CREATE TABLE IF NOT EXISTS sw_ingestion_state "
-					"(id INT PRIMARY KEY, checksum TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
-				)
-			conn.commit()
-
-			if self._is_dataset_current(conn, checksum):
-				return
-
-			first_embedding = self._ollama_embedding(docs[0]["content"])
-			if not first_embedding:
-				raise RuntimeError("No se pudo generar embedding del dataset remoto.")
-
-			embedding_dim = len(first_embedding)
-			self._ensure_vector_schema(conn, embedding_dim)
-
-			with conn.cursor() as cur:
-				for idx, doc in enumerate(docs):
-					embedding = first_embedding if idx == 0 else self._ollama_embedding(doc["content"])
-					if not embedding:
-						continue
-
-					content_hash = hashlib.sha256(doc["content"].encode("utf-8")).hexdigest()
+				cur.execute("SELECT pg_try_advisory_lock(456789)")
+				if not cur.fetchone()[0]:
+					return  # Otro proceso ya está sincronizando, salimos pacíficamente
+				
+			try:
+				with conn.cursor() as cur:
+					cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
 					cur.execute(
-						"""
-						INSERT INTO sw_knowledge (source, content, content_hash, meta, embedding)
-						VALUES (%s, %s, %s, %s::jsonb, %s::vector)
-						ON CONFLICT (content_hash) DO UPDATE
-						SET source = EXCLUDED.source,
-							content = EXCLUDED.content,
-							meta = EXCLUDED.meta,
-							embedding = EXCLUDED.embedding
-						""",
-						(
-							doc["source"],
-							doc["content"],
-							content_hash,
-							json.dumps(doc["meta"], ensure_ascii=True),
-							self._vector_literal(embedding),
-						),
+						"CREATE TABLE IF NOT EXISTS sw_ingestion_state "
+						"(id INT PRIMARY KEY, checksum TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
 					)
-			conn.commit()
-			self._save_dataset_checksum(conn, checksum)
+				conn.commit()
+
+				if self._is_dataset_current(conn, checksum):
+					return
+
+				first_embedding = self._ollama_embedding(docs[0]["content"])
+				if not first_embedding:
+					raise RuntimeError("No se pudo generar embedding del dataset remoto.")
+
+				embedding_dim = len(first_embedding)
+				self._ensure_vector_schema(conn, embedding_dim)
+
+				with conn.cursor() as cur:
+					for idx, doc in enumerate(docs):
+						embedding = first_embedding if idx == 0 else self._ollama_embedding(doc["content"])
+						if not embedding:
+							continue
+
+						content_hash = hashlib.sha256(doc["content"].encode("utf-8")).hexdigest()
+						cur.execute(
+							"""
+							INSERT INTO sw_knowledge (source, content, content_hash, meta, embedding)
+							VALUES (%s, %s, %s, %s::jsonb, %s::vector)
+							ON CONFLICT (content_hash) DO UPDATE
+							SET source = EXCLUDED.source,
+								content = EXCLUDED.content,
+								meta = EXCLUDED.meta,
+								embedding = EXCLUDED.embedding
+							""",
+							(
+								doc["source"],
+								doc["content"],
+								content_hash,
+								json.dumps(doc["meta"], ensure_ascii=True),
+								self._vector_literal(embedding),
+							),
+						)
+				conn.commit()
+				self._save_dataset_checksum(conn, checksum)
+			finally:
+				with conn.cursor() as cur:
+					cur.execute("SELECT pg_advisory_unlock(456789)")
 
 	def _retrieve_context(self, query: str) -> List[Dict[str, Any]]:
 		query_embedding = self._ollama_embedding(query)
@@ -287,7 +302,7 @@ class Pipeline:
 		context_text = "\n\n".join(context_blocks)
 		return (
 			"Eres un asistente RAG especializado en Seven Wonders. "
-			"Responde en espanol, de forma clara, y cita la evidencia del contexto.\n\n"
+			"Responde en español, de forma clara, y cita la evidencia del contexto.\n\n"
 			f"Contexto recuperado:\n{context_text}\n\n"
 			f"Pregunta del usuario: {question}\n"
 			"Respuesta:"
@@ -301,7 +316,13 @@ class Pipeline:
 		body: Dict[str, Any],
 	) -> str:
 		try:
-			self._sync_dataset_to_pgvector()
+			if time.time() - getattr(self, "_last_sync_time", 0) > self.valves.SYNC_INTERVAL_SECONDS:
+				try:
+					self._sync_dataset_to_pgvector()
+					self._last_sync_time = time.time()
+				except Exception as e:
+					logging.warning(f"No se pudo sincronizar el dataset en pipe(): {e}")
+
 			context_items = self._retrieve_context(user_message)
 			prompt = self._build_prompt(user_message, context_items)
 			
@@ -318,5 +339,6 @@ class Pipeline:
 				
 			return f"{answer}{metrics_footer}"
 		except Exception as exc:  # pylint: disable=broad-except
-			return f"Error en pipeline seven_wonders_rag: {exc}"
+			logging.error(f"Error en pipeline seven_wonders_rag: {exc}", exc_info=True)
+			return "Lo sentimos, ocurrió un error interno al procesar tu solicitud en el pipeline de Seven Wonders."
 
